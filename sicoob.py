@@ -24,39 +24,56 @@ SICOOB_SCOPE = "boletos_inclusao boletos_consulta boletos_alteracao webhooks_inc
 # ===================== CONFIG SUPABASE ======================
 
 SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA")
+SUPABASE_KEY = os.environ.get(
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+)
 
-CERT_CACHE: Optional[Tuple[str, str]] = None  # (cert_path, key_path)
+# cache por usuário: {user: (cert_path, key_path)}
+CERT_CACHE: Dict[str, Tuple[str, str]] = {}
 
 
 # ===================== CARREGAR CERTIFICADO DO SUPABASE ======================
 
-def carregar_certificados_local() -> Tuple[Optional[Tuple[str, str]], Optional[str]]:
+def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tuple[str, str]], Optional[str]]:
     """
-    Busca o último certificado salvo na tabela certifica_sicoob.
+    Busca o último certificado salvo na tabela sicoob_certifica (ou certifica_sicoob).
+    Se 'user' for informado, filtra pelos registros daquele usuário.
     Os campos pem e key estão em base64 — decodifica e grava em arquivos temporários.
     """
 
     global CERT_CACHE
-    if CERT_CACHE is not None:
-        return CERT_CACHE, None
+
+    # chave de cache (por usuário, ou um default)
+    cache_key = user or "_default"
+
+    if cache_key in CERT_CACHE:
+        return CERT_CACHE[cache_key], None
 
     if not SUPABASE_KEY:
         return None, "SUPABASE_SERVICE_ROLE_KEY não configurada"
 
-    # Busca no Supabase
+    # Monta parâmetros da consulta
+    params = {
+        "select": "pem,key",
+        "order": "id.desc",
+        "limit": "1",
+    }
+
+    # se tiver user, filtra: ?user=eq.email@...
+    if user:
+        params["user"] = f"eq.{user}"
+
     try:
+        # ⚠️ Se a tabela no Supabase se chamar certifica_sicoob,
+        # troque 'sicoob_certifica' por 'certifica_sicoob' aqui:
         resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/certifica_sicoob",
+            f"{SUPABASE_URL}/rest/v1/sicoob_certifica",
             headers={
                 "apikey": SUPABASE_KEY,
                 "Authorization": f"Bearer {SUPABASE_KEY}",
             },
-            params={
-                "select": "pem,key",
-                "order": "id.desc",
-                "limit": "1",
-            },
+            params=params,
             timeout=20,
         )
     except Exception as e:
@@ -71,7 +88,7 @@ def carregar_certificados_local() -> Tuple[Optional[Tuple[str, str]], Optional[s
         return None, f"Resposta inválida do Supabase: {resp.text}"
 
     if not rows:
-        return None, "Nenhum certificado encontrado"
+        return None, "Nenhum certificado encontrado para este usuário"
 
     row = rows[0]
     pem_b64 = row.get("pem")
@@ -100,9 +117,9 @@ def carregar_certificados_local() -> Tuple[Optional[Tuple[str, str]], Optional[s
     except Exception as e:
         return None, f"Erro ao criar arquivos temporários: {e}"
 
-    CERT_CACHE = (cert_path, key_path)
-    print("✔ Certificado carregado do Supabase:", CERT_CACHE)
-    return CERT_CACHE, None
+    CERT_CACHE[cache_key] = (cert_path, key_path)
+    print(f"✔ Certificado carregado do Supabase para {cache_key}: {CERT_CACHE[cache_key]}")
+    return CERT_CACHE[cache_key], None
 
 
 # ===================== TOKEN SICOOB ======================
@@ -160,7 +177,7 @@ def emitir_boleto_sicoob(token: str, dados: Dict[str, Any], cert_files: Tuple[st
 
     try:
         j = resp.json()
-    except:
+    except Exception:
         return None, f"Resposta inválida do Sicoob: {resp.text}"
 
     if not resp.ok:
@@ -171,10 +188,14 @@ def emitir_boleto_sicoob(token: str, dados: Dict[str, Any], cert_files: Tuple[st
 
 # ===================== BAIXAR PDF ======================
 
-def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int,
-                      n_cliente: int, modalidade: int,
-                      cert_files: Tuple[str, str]):
-
+def baixar_pdf_boleto(
+    token: str,
+    n_contrato: int,
+    n_nosso: int,
+    n_cliente: int,
+    modalidade: int,
+    cert_files: Tuple[str, str]
+):
     cert_path, key_path = cert_files
 
     params = {
@@ -196,7 +217,10 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int,
     except Exception as e:
         return None, f"Erro ao baixar PDF: {e}"
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, f"Resposta inválida ao baixar PDF: {resp.text}"
 
     if not resp.ok:
         return None, data
@@ -207,7 +231,7 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int,
 
     try:
         pdf_bytes = base64.b64decode(pdf_b64)
-    except:
+    except Exception:
         return None, "Erro ao decodificar pdfBoleto"
 
     return pdf_bytes, None
@@ -217,14 +241,25 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int,
 
 @app.get("/")
 def home():
-    return "API Sicoob (Flask) — rodando com certificado vindo do Supabase."
+    return "API Sicoob (Flask) — rodando com certificado vindo do Supabase por usuário."
 
 
 @app.post("/sicoob/emitir")
 def api_emitir():
+    """
+    Espera um JSON com todos os dados do boleto + campo 'user'
+    Exemplo mínimo:
+    {
+        "user": "email@cliente.com",
+        "numeroCliente": 409987,
+        "numeroContaCorrente": 218812,
+        ...
+    }
+    """
     payload = request.get_json(silent=True) or {}
 
-    cert_files, erro_cert = carregar_certificados_local()
+    user = payload.get("user")
+    cert_files, erro_cert = carregar_certificados_local(user)
     if erro_cert:
         return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 500
 
@@ -248,9 +283,20 @@ def api_emitir():
 
 @app.post("/sicoob/pdf")
 def api_pdf():
+    """
+    Espera um JSON:
+    {
+        "user": "email@cliente.com",
+        "numeroContratoCobranca": 123,
+        "nossoNumero": 456,
+        "numeroCliente": 409987,
+        "codigoModalidade": 1
+    }
+    """
     dados = request.get_json(silent=True) or {}
 
-    cert_files, erro_cert = carregar_certificados_local()
+    user = dados.get("user")
+    cert_files, erro_cert = carregar_certificados_local(user)
     if erro_cert:
         return jsonify({"erro": erro_cert}), 500
 
@@ -279,4 +325,5 @@ def api_pdf():
 
 
 if __name__ == "__main__":
+    # para rodar local
     app.run(host="127.0.0.1", port=5000, debug=True)
